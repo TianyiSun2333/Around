@@ -39,7 +39,7 @@ const (
 	DISTANCE    = "200km"
 	INDEX       = "around" // to tell elastic that the user is around, not jupiter, like the name of DB
 	TYPE        = "post"
-	ES_URL      = "http://35.184.19.91:9200/" // the actually elastic server in GCE
+	ES_URL      = "http://35.226.154.28:9200/" // the actually elastic server in GCE
 )
 
 func main() {
