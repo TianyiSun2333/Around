@@ -1,10 +1,13 @@
 package main
 
 import (
+	"cloud.google.com/go/storage"
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/pborman/uuid"
 	elastic "gopkg.in/olivere/elastic.v3"
+	"io"
 	"log"
 	"net/http"
 	"reflect"
@@ -27,14 +30,16 @@ type Post struct {
 	// exported name must be capital
 	User     string   `json:"user"`
 	Message  string   `json:"message"`
+	Url      string   `json:"url"`
 	Location Location `json:"location"`
 }
 
 const (
-	DISTANCE = "200km"
-	INDEX    = "around" // to tell elastic that the user is around, not jupiter, like the name of DB
-	TYPE     = "post"
-	ES_URL   = "http://35.225.190.221:9200/" // the actually elastic server in GCE
+	BUCKET_NAME = "post-images-206505"
+	DISTANCE    = "200km"
+	INDEX       = "around" // to tell elastic that the user is around, not jupiter, like the name of DB
+	TYPE        = "post"
+	ES_URL      = "http://35.184.19.91:9200/" // the actually elastic server in GCE
 )
 
 func main() {
@@ -108,35 +113,96 @@ func main() {
 // }
 // JSON: snake case; to uniform the name writing between JSON and GO
 func handlerPost(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received one post request.")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
-	// the body in the request
-	// JSON from user
-	decoder := json.NewDecoder(r.Body)
-	var p Post
+	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+	r.ParseMultipartForm(32 << 20)
 
-	// create new Post
-	// get the data from user
-	// ; two statements in the line
-	// &p: Decode(<takes a pointer, so, need to pass an address>)
-	// to change the value of p
-	// Decode() only return a error
-	// change JSON to our struct
-	// once leave if, err can not be reached, life cycle like java
-	if err := decoder.Decode(&p); err != nil {
-		// if error happens
-		// java throws
+	// Parse form data
+	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+	// get the string data
+	p := &Post{
+		User:    "1111",
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
+	}
+
+	id := uuid.New()
+
+	// get the image
+	// <file> <header>
+	// FormFile: read file data
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v.\n", err)
 		panic(err)
 	}
-	// write in to w
-	// file print format, anyone supporting IOstream can use this
-	fmt.Fprintf(w, "Post received: %s\n", p.Message)
+	defer file.Close()
 
-	// es use id to distince message
-	// use uuid to generate a new id
-	id := uuid.New()
+	// when save to GCS, need access
+	ctx := context.Background()
+
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		panic(err)
+	}
+
+	// when stored in GCS, the return url is attrs, save it to p.Url
+	p.Url = attrs.MediaLink
+
 	// save user post to es
-	saveToES(&p, id)
+	saveToES(p, id)
+}
+
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	// create a client, like a connection
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// create a bucket handle with a target name
+	bucket := client.Bucket(bucketName)
+
+	// ckeck if this bucket can be use
+	if _, err := bucket.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	obj := bucket.Object(name)
+	wc := obj.NewWriter(ctx)
+
+	// write to GCS
+	if _, err := io.Copy(wc, r); err != nil {
+		return nil, nil, err
+	}
+
+	if err := wc.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	// offer read access to all users
+	// access control lease
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+
+	return obj, attrs, err
 }
 
 // elastic search also stores data, is a DB
@@ -221,6 +287,12 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 
 	js, err := json.Marshal(ps)
 	if err != nil {
+		// right error processing
+		// fmt.PrintF(w, "search input should be double value")
+		// panic(err) or return (both can shutdown the go routine)
+		// panic(err) can print the stack trace in the console
+		// return will not
+
 		panic(err)
 	}
 
