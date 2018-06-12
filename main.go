@@ -5,14 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
 	"github.com/pborman/uuid"
 	elastic "gopkg.in/olivere/elastic.v3"
 	"io"
 	"log"
 	"net/http"
 	"reflect"
+
 	"strconv"
 )
+
+// multi thread read and write:
+// like synchronized, writing lock, when writing others cannot read
 
 // GO struct and JSON transfer
 
@@ -39,8 +46,11 @@ const (
 	DISTANCE    = "200km"
 	INDEX       = "around" // to tell elastic that the user is around, not jupiter, like the name of DB
 	TYPE        = "post"
-	ES_URL      = "http://35.226.154.28:9200/" // the actually elastic server in GCE
+	ES_URL      = "http://35.232.110.85:9200/" // the actually elastic server in GCE
 )
+
+// slice of byte
+var mySigningKey = []byte("secret")
 
 func main() {
 
@@ -82,12 +92,36 @@ func main() {
 	}
 
 	fmt.Println("Started-service")
+
+	r := mux.NewRouter()
+
+	// token checker
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+
+		// get server signing key
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
 	// <endpoint> <which function endpoint are using>
 	// like <servlet> <doPost>
 	// handler is call back funtion, so there are concurrent
 	// handlerPost and handlerSearch has two GO routine to manage them
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
+
+	// middleware make sure that the token user send is can match
+	// if match, pass the request to our http handler
+	// Method(): to see whether post or get
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+
+	// user input password, no tokens generate yet
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
+
 	// once error happens
 	// <port> <handler>
 	// handler has been create in last line
@@ -117,6 +151,10 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
 	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
 	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
 	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
@@ -128,7 +166,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 	// get the string data
 	p := &Post{
-		User:    "1111",
+		User:    username.(string),
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -138,7 +176,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 	id := uuid.New()
 
-	// get the image
+	// get the image we post
 	// <file> <header>
 	// FormFile: read file data
 	file, _, err := r.FormFile("image")
@@ -149,7 +187,11 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	// like java ticket master api key
+	// like a personal id
 	// when save to GCS, need access
+	// generate a api key
+	// when on GAE, my account is bonded to GAE, so we do not need to install key manually
 	ctx := context.Background()
 
 	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
@@ -166,24 +208,32 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	saveToES(p, id)
 }
 
+// <metadata of the object> <content of the file, including URL of the object we post>
+// storage: GCS api
 func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	// like creating a client when using elastic search
 	// create a client, like a connection
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// bucket is like folder
 	// create a bucket handle with a target name
 	bucket := client.Bucket(bucketName)
 
 	// ckeck if this bucket can be use
+	// <attrs> try to get attribute of the bucket, to see if the bucket exist
 	if _, err := bucket.Attrs(ctx); err != nil {
 		return nil, nil, err
 	}
 
+	// uuid in distinguish the file
 	obj := bucket.Object(name)
+	// a writer can write to the object in the bucket
 	wc := obj.NewWriter(ctx)
 
+	// r is file
 	// write to GCS
 	if _, err := io.Copy(wc, r); err != nil {
 		return nil, nil, err
@@ -195,10 +245,12 @@ func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*stor
 
 	// offer read access to all users
 	// access control lease
+	// RoleReader: reader only
 	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
 		return nil, nil, err
 	}
 
+	// return the attribute of the object, like url in the object
 	attrs, err := obj.Attrs(ctx)
 	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
 
