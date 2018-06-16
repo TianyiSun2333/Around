@@ -41,6 +41,9 @@ func checkUser(username, password string) bool {
 		return false
 	}
 
+	// termquery: key word search
+	// termquery: only recognize lower case
+	// so we only allow lower case in username
 	// index: name DB
 	termQuery :=
 		elastic.NewTermQuery("username", username)
@@ -148,6 +151,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// generate token
 	if checkUser(u.Username, u.Password) {
 		// generate token
 		token := jwt.New(jwt.SigningMethodHS256)
@@ -155,6 +159,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		claims := token.Claims.(jwt.MapClaims)
 		/* Set token claims */
 		claims["username"] = u.Username
+		// Unix() change to second
 		claims["exp"] = time.Now().Add(time.Hour * 24).Unix()
 
 		/* Sign the token with our secret */

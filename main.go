@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
@@ -14,7 +15,6 @@ import (
 	"log"
 	"net/http"
 	"reflect"
-
 	"strconv"
 )
 
@@ -47,6 +47,8 @@ const (
 	INDEX       = "around" // to tell elastic that the user is around, not jupiter, like the name of DB
 	TYPE        = "post"
 	ES_URL      = "http://35.232.110.85:9200/" // the actually elastic server in GCE
+	PROJECT_ID  = "sigma-sunlight-206505"
+	BT_INSTANCE = "around-post"
 )
 
 // slice of byte
@@ -151,6 +153,10 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
+	// "user" now is the token
+	// .(*jwt.Token) cast to a token type
+	// .(jwt.MapClaims) cast to a map token
+	// this map can get value from token string
 	user := r.Context().Value("user")
 	claims := user.(*jwt.Token).Claims
 	username := claims.(jwt.MapClaims)["username"]
@@ -206,6 +212,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 	// save user post to es
 	saveToES(p, id)
+	saveToBigTable(p, id)
 }
 
 // <metadata of the object> <content of the file, including URL of the object we post>
@@ -255,6 +262,40 @@ func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*stor
 	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
 
 	return obj, attrs, err
+}
+
+func saveToBigTable(p *Post, id string) {
+	ctx := context.Background()
+	// you must update project name here
+	// <project id> <bt-instance> globally locate the table
+	// create a bigtable instance to link big table
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	tbl := bt_client.Open("post")
+	// mutation: operation unit
+	// set one row data
+	mut := bigtable.NewMutation()
+	// write a timestamp
+	t := bigtable.Now()
+
+	// []byte stored in the bigtable
+	mut.Set("post", "user", t, []byte(p.User))
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	// client apply the mutator
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+
 }
 
 // elastic search also stores data, is a DB
