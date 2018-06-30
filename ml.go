@@ -12,24 +12,33 @@ import (
 	"strings"
 )
 
+// Prediction struct to parse the result
 // <Prediction> index of our model
 type Prediction struct {
-	Prediction int       `json:"prediction"`
-	Key        string    `json:"key"`
-	Scores     []float64 `json:"scores"`
+	// like index of the model
+	Prediction int `json:"prediction"`
+	// lable
+	Key string `json:"key"`
+	// the two score
+	// <probability> <xxx>
+	Scores []float64 `json:"scores"`
 }
 
 type MlResponse struct {
 	Predictions []Prediction `json:"predictions"`
 }
 
+// parse input
 // ImageBytes: the type of the file
 type ImageBytes struct {
 	B64 []byte `json:"b64"`
 }
 type Instance struct {
+	// image byte-version content
 	ImageBytes ImageBytes `json:"image_bytes"`
-	Key        string     `json:"key"`
+	// when multiple model to indicate
+	// <tag> to represent that in google api
+	Key string `json:"key"`
 }
 
 type MlRequest struct {
@@ -44,9 +53,12 @@ var (
 	scope   = "https://www.googleapis.com/auth/cloud-platform"
 )
 
+// <io.Reader>: this image
+// return <float64>: the final score(probability)
 // Annotate a image file based on ml model, return score and error if exists.
 func annotate(r io.Reader) (float64, error) {
 	ctx := context.Background()
+	// read to byte array from image
 	buf, _ := ioutil.ReadAll(r)
 
 	ts, err := google.DefaultTokenSource(ctx, scope)
@@ -68,6 +80,7 @@ func annotate(r io.Reader) (float64, error) {
 			},
 		},
 	}
+	// change this request to json
 	body, _ := json.Marshal(request)
 
 	// Construct a http request.

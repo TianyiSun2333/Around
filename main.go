@@ -14,8 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	// what's for
-	"path/filepath"
+	"path/filepath" // for using prefix API
 	"reflect"
 	"strconv"
 )
@@ -47,7 +46,7 @@ type Post struct {
 }
 
 const (
-	// why do we need to change api-prefix
+	// since sometime the frontend and backend have the same name of the endpoint, so we need to distinguish whether the given endpoint is for front end or backend
 	API_PREFIX  = "/api/v1"
 	BUCKET_NAME = "post-images-206505"
 	DISTANCE    = "200km"
@@ -146,7 +145,7 @@ func main() {
 	// Backend endpoints.
 	http.Handle(API_PREFIX+"/", r)
 	// Frontend endpoints.
-	// where is this build location
+	// in the build folder
 	http.Handle("/", http.FileServer(http.Dir("build")))
 
 	// once error happens
@@ -236,6 +235,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// has been passed to GCS, now the file buffer is empty, so need to read again
 	im, header, _ := r.FormFile("image")
 	defer im.Close()
+	// get the suffix of this file
 	suffix := filepath.Ext(header.Filename)
 
 	// Client needs to know the media type so as to render it.
@@ -475,10 +475,16 @@ func handlerCluster(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
+	// browser will send OPTIONS to check if the endpoint exist
+	// if OPTIONS, only return the header
+	// otherwise run the rest of the code
 	if r.Method != "GET" {
 		return
 	}
 
+	// Get("") is getting "term" param in URL
+	// now we only have one ML model "face"
+	// if we have multiple model, we can use Prdiction[0] or[1] to refer to diferent model
 	term := r.URL.Query().Get("term")
 
 	// Create a client
