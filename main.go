@@ -1,7 +1,7 @@
 package main
 
 import (
-	"cloud.google.com/go/bigtable"
+	//	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
@@ -14,6 +14,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	// what's for
+	"path/filepath"
 	"reflect"
 	"strconv"
 )
@@ -22,7 +24,6 @@ import (
 // like synchronized, writing lock, when writing others cannot read
 
 // GO struct and JSON transfer
-
 type Location struct {
 	// float64: java double
 	// java class
@@ -35,24 +36,44 @@ type Location struct {
 // post behavior of user
 type Post struct {
 	// exported name must be capital
-	User     string   `json:"user"`
-	Message  string   `json:"message"`
-	Url      string   `json:"url"`
+	User    string `json:"user"`
+	Message string `json:"message"`
+	Url     string `json:"url"`
+	// easier for frontend to process
+	Type string  `json:"type"`
+	Face float64 `json:"face"`
+
 	Location Location `json:"location"`
 }
 
 const (
+	// why do we need to change api-prefix
+	API_PREFIX  = "/api/v1"
 	BUCKET_NAME = "post-images-206505"
 	DISTANCE    = "200km"
 	INDEX       = "around" // to tell elastic that the user is around, not jupiter, like the name of DB
 	TYPE        = "post"
-	ES_URL      = "http://35.232.110.85:9200/" // the actually elastic server in GCE
+	ES_URL      = "http://35.238.11.119:9200/" // the actually elastic server in GCE
 	PROJECT_ID  = "sigma-sunlight-206505"
 	BT_INSTANCE = "around-post"
 )
 
 // slice of byte
 var mySigningKey = []byte("secret")
+
+var (
+	mediaTypes = map[string]string{
+		".jpeg": "image",
+		".jpg":  "image",
+		".gif":  "image",
+		".png":  "image",
+		".mov":  "video",
+		".mp4":  "video",
+		".avi":  "video",
+		".flv":  "video",
+		".wmv":  "video",
+	}
+)
 
 func main() {
 
@@ -115,14 +136,18 @@ func main() {
 	// middleware make sure that the token user send is can match
 	// if match, pass the request to our http handler
 	// Method(): to see whether post or get
-	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
-	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
-
+	r.Handle(API_PREFIX+"/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle(API_PREFIX+"/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle(API_PREFIX+"/cluster", jwtMiddleware.Handler(http.HandlerFunc(handlerCluster)))
 	// user input password, no tokens generate yet
-	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
-	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+	r.Handle(API_PREFIX+"/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle(API_PREFIX+"/signup", http.HandlerFunc(signupHandler)).Methods("POST")
 
-	http.Handle("/", r)
+	// Backend endpoints.
+	http.Handle(API_PREFIX+"/", r)
+	// Frontend endpoints.
+	// where is this build location
+	http.Handle("/", http.FileServer(http.Dir("build")))
 
 	// once error happens
 	// <port> <handler>
@@ -207,12 +232,35 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
+	// now need to read it again, since last time the readed file
+	// has been passed to GCS, now the file buffer is empty, so need to read again
+	im, header, _ := r.FormFile("image")
+	defer im.Close()
+	suffix := filepath.Ext(header.Filename)
+
+	// Client needs to know the media type so as to render it.
+	if t, ok := mediaTypes[suffix]; ok {
+		p.Type = t
+	} else {
+		p.Type = "unknown"
+	}
+	// ML Engine only supports jpeg.
+	if suffix == ".jpeg" {
+		if score, err := annotate(im); err != nil {
+			http.Error(w, "Failed to annotate the image", http.StatusInternalServerError)
+			fmt.Printf("Failed to annotate the image %v\n", err)
+			return
+		} else {
+			p.Face = score
+		}
+	}
+
 	// when stored in GCS, the return url is attrs, save it to p.Url
 	p.Url = attrs.MediaLink
 
 	// save user post to es
 	saveToES(p, id)
-	saveToBigTable(p, id)
+	//	saveToBigTable(p, id)
 }
 
 // <metadata of the object> <content of the file, including URL of the object we post>
@@ -264,7 +312,9 @@ func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*stor
 	return obj, attrs, err
 }
 
+/*
 func saveToBigTable(p *Post, id string) {
+	// contains meta data for creating the connection with big table
 	ctx := context.Background()
 	// you must update project name here
 	// <project id> <bt-instance> globally locate the table
@@ -297,6 +347,8 @@ func saveToBigTable(p *Post, id string) {
 	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
 
 }
+
+*/
 
 // elastic search also stores data, is a DB
 func saveToES(p *Post, id string) {
@@ -415,4 +467,68 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		w.Write(js)
 		fmt.Fprintf(w, "Search received: %s %s", lat, lon)
 	*/
+}
+
+func handlerCluster(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Received one request for clustering")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method != "GET" {
+		return
+	}
+
+	term := r.URL.Query().Get("term")
+
+	// Create a client
+	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
+	if err != nil {
+		http.Error(w, "ES is not setup", http.StatusInternalServerError)
+		fmt.Printf("ES is not setup %v\n", err)
+		return
+	}
+
+	// Range query.
+	// For details, https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-range-query.html
+	// Gte: greater than equal
+	q := elastic.NewRangeQuery(term).Gte(0.9)
+
+	searchResult, err := client.Search().
+		Index(INDEX).
+		Query(q).
+		Pretty(true).
+		Do()
+	if err != nil {
+		// Handle error
+		m := fmt.Sprintf("Failed to query ES %v", err)
+		fmt.Println(m)
+		http.Error(w, m, http.StatusInternalServerError)
+	}
+
+	// searchResult is of type SearchResult and returns hits, suggestions,
+	// and all kinds of other information from Elasticsearch.
+	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
+	// TotalHits is another convenience function that works even when something goes wrong.
+	fmt.Printf("Found a total of %d post\n", searchResult.TotalHits())
+
+	// Each is a convenience function that iterates over hits in a search result.
+	// It makes sure you don't need to check for nil values in the response.
+	// However, it ignores errors in serialization.
+	var typ Post
+	var ps []Post
+	for _, item := range searchResult.Each(reflect.TypeOf(typ)) {
+		p := item.(Post)
+		ps = append(ps, p)
+
+	}
+	js, err := json.Marshal(ps)
+	if err != nil {
+		m := fmt.Sprintf("Failed to parse post object %v", err)
+		fmt.Println(m)
+		http.Error(w, m, http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(js)
 }
